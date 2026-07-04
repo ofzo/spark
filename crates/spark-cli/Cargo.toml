@@ -8,5 +8,9 @@ description = "Spark CLI - Pure Rust JavaScript engine command-line interface"
 name = "spark"
 path = "src/main.rs"
 
+[[bin]]
+name = "test262-runner"
+path = "src/bin/test262-runner.rs"
+
 [dependencies]
 spark-core = { path = "../spark-core" }
