@@ -1,0 +1,12 @@
+[package]
+name = "spark-cli"
+version.workspace = true
+edition.workspace = true
+description = "Spark CLI - Pure Rust JavaScript engine command-line interface"
+
+[[bin]]
+name = "spark"
+path = "src/main.rs"
+
+[dependencies]
+spark-core = { path = "../spark-core" }

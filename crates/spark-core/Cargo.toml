@@ -1,0 +1,8 @@
+[package]
+name = "spark-core"
+version.workspace = true
+edition.workspace = true
+description = "Spark - A pure Rust JavaScript engine (zero dependencies, zero unsafe)"
+
+[dependencies]
+# No external dependencies - pure Rust only
