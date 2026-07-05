@@ -635,31 +635,11 @@ impl Parser {
         }
         while self.peek_char().map_or(false, |c| c.is_ascii_digit()) { self.advance_char(); }
         if self.peek_char() == Some('.') {
-            // Check if this is a decimal point (not a property access).
             // DecimalLiteral :: DecimalIntegerLiteral . DecimalDigits_opt ExponentPart_opt
-            let next = self.peek_char_at(1);
-            if next.map_or(false, |c| c.is_ascii_digit()) {
-                // Has fractional digits: consume '.' and digits
-                self.advance_char();
-                while self.peek_char().map_or(false, |c| c.is_ascii_digit()) { self.advance_char(); }
-            } else {
-                // No fractional digits: trailing dot is valid (e.g. "0.")
-                // Only consume '.' if it's clearly part of the number, not property access
-                // Heuristic: consume '.' if next char is not an identifier start or '('
-                match next {
-                    Some(c) if c.is_alphabetic() || c == '_' || c == '$' => {
-                        // Property access: don't consume '.'
-                    }
-                    Some('(') => {
-                        // Could be method call, but 0.toString() is invalid anyway
-                        // Don't consume '.' — this leaves it for the parser
-                    }
-                    _ => {
-                        // Consume '.' as part of the number literal
-                        self.advance_char();
-                    }
-                }
-            }
+            // Always consume '.' as part of the number — 0.toString() is meant to be
+            // a syntax error in JS; the correct form is (0).toString() or 0..toString()
+            self.advance_char(); // consume '.'
+            while self.peek_char().map_or(false, |c| c.is_ascii_digit()) { self.advance_char(); }
         }
         if self.peek_char() == Some('e') || self.peek_char() == Some('E') {
             self.advance_char();
