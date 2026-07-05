@@ -635,8 +635,20 @@ impl JSValue {
             JSValue::BigInt(b) => b.borrow().value.clone() + "n",
             JSValue::Object(obj) => {
                 let borrow = obj.borrow();
+                // Try calling the JavaScript toString() method
+                if let Some(to_string_fn) = self.get_property("toString") {
+                    match &to_string_fn {
+                        JSValue::Function(f) => {
+                            let func = f.borrow();
+                            if let FunctionBody::Native(native_fn) = &func.body {
+                                return native_fn(self, &[]).to_string();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // Fallback: array join or [object Object]
                 if borrow.class_name == "Array" {
-                    // Array.prototype.toString: join elements with commas
                     let len = borrow.properties.get("length")
                         .map(|v| v.to_number() as usize)
                         .unwrap_or(0);
@@ -649,7 +661,7 @@ impl JSValue {
                         .collect();
                     parts.join(",")
                 } else {
-                    "[object Object]".to_string()
+                    format!("[object {}]", borrow.class_name)
                 }
             }
             JSValue::Function(f) => {
