@@ -681,12 +681,15 @@ impl Compiler {
     ) -> Result<(), CompileError> {
         let func_idx = self.function.functions.len() as u32;
 
-        // Collect outer scope variable names for closure capture
+        // Collect outer scope variable names for closure capture.
+        // Include both locally declared variables AND variables captured from
+        // outer scopes, so they propagate to further nested functions.
         let mut outer_vars: Vec<String> = self.var_map.iter()
             .flat_map(|scope| scope.keys().cloned())
+            .chain(self.closure_var_map.keys().cloned())
             .collect();
         outer_vars.sort();
-        outer_vars.dedup(); // Remove duplicates from multiple scopes
+        outer_vars.dedup();
 
         // Mark outer variables as captured
         for var_name in &outer_vars {
@@ -779,12 +782,15 @@ impl Compiler {
         let func_name = name.clone().unwrap_or_default();
         let func_idx = self.function.functions.len() as u32;
 
-        // Collect outer scope variable names for closure capture
+        // Collect outer scope variable names for closure capture.
+        // Include both locally declared variables AND variables captured from
+        // outer scopes, so they propagate to further nested functions.
         let mut outer_vars: Vec<String> = self.var_map.iter()
             .flat_map(|scope| scope.keys().cloned())
+            .chain(self.closure_var_map.keys().cloned())
             .collect();
         outer_vars.sort();
-        outer_vars.dedup(); // Remove duplicates from multiple scopes
+        outer_vars.dedup();
 
         // Mark outer variables as captured
         for var_name in &outer_vars {
@@ -842,12 +848,15 @@ impl Compiler {
     ) -> Result<(), CompileError> {
         let func_idx = self.function.functions.len() as u32;
 
-        // Collect outer scope variable names for closure capture
+        // Collect outer scope variable names for closure capture.
+        // Include both locally declared variables AND variables captured from
+        // outer scopes, so they propagate to further nested functions.
         let mut outer_vars: Vec<String> = self.var_map.iter()
             .flat_map(|scope| scope.keys().cloned())
+            .chain(self.closure_var_map.keys().cloned())
             .collect();
         outer_vars.sort();
-        outer_vars.dedup(); // Remove duplicates from multiple scopes
+        outer_vars.dedup();
 
         // Mark outer variables as captured
         for var_name in &outer_vars {
