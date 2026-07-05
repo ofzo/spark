@@ -60,7 +60,7 @@ var assert = (function() {
         }
     }
 
-    function _throws(shouldThrow, expectedError, fn, msg) {
+    function _throws(expectedError, fn, msg) {
         var threw = false;
         var exc;
         try {
@@ -72,7 +72,7 @@ var assert = (function() {
         if (!threw) {
             throw new Test262Error(msg || 'Expected function to throw, but it did not');
         }
-        if (expectedError !== undefined) {
+        if (expectedError !== undefined && expectedError !== null) {
             if (typeof expectedError === 'function') {
                 if (!(exc instanceof expectedError)) {
                     throw new Test262Error(
@@ -81,7 +81,7 @@ var assert = (function() {
                         ' but got ' + (exc && exc.name ? exc.name : typeof exc)
                     );
                 }
-            } else if (expectedError !== exc && expectedError !== (exc && exc.constructor)) {
+            } else if (exc !== expectedError && (exc && exc.constructor !== expectedError)) {
                 throw new Test262Error(
                     (msg ? msg + ': ' : '') +
                     'Expected ' + String(expectedError) + ' but got ' + String(exc)
@@ -240,23 +240,25 @@ fn create_runtime() -> (Rc<RefCell<JSRuntime>>, JSContext) {
     (rt, ctx)
 }
 
-fn compile_only(code: &str) -> Result<(), String> {
+fn compile_only(code: &str, strict: bool) -> Result<(), String> {
     use spark_core::compiler::Compiler;
     use spark_core::parser::Parser;
 
     let mut parser = Parser::new(code);
+    parser.set_strict_mode(strict);
     let ast = parser.parse().map_err(|e| format!("Parse error: {}", e))?;
     let mut compiler = Compiler::new();
     compiler.compile(&ast).map_err(|e| format!("Compile error: {}", e))?;
     Ok(())
 }
 
-fn eval_test(rt: &Rc<RefCell<JSRuntime>>, code: &str) -> Result<String, String> {
+fn eval_test(rt: &Rc<RefCell<JSRuntime>>, code: &str, strict: bool) -> Result<String, String> {
     use spark_core::compiler::Compiler;
     use spark_core::interpreter::Interpreter;
     use spark_core::parser::Parser;
 
     let mut parser = Parser::new(code);
+    parser.set_strict_mode(strict);
     let ast = parser.parse().map_err(|e| format!("Parse error: {}", e))?;
     let mut compiler = Compiler::new();
     compiler.compile(&ast).map_err(|e| format!("Compile error: {}", e))?;
@@ -294,11 +296,16 @@ fn run_test_file(path: &Path) -> TestResult {
         return TestResult::Skip(format!("includes: {:?} (helpers not supported)", meta.includes));
     }
 
+    // Determine modes for runtime tests
+    let only_strict = meta.flags.contains(&"onlyStrict".to_string());
+    let no_strict = meta.flags.contains(&"noStrict".to_string());
+
     // Handle parse-phase negative tests: compile test code only (no harness),
     // expect a parse error matching the expected type.
     if let Some(ref neg) = meta.negative {
         if neg.phase == "parse" {
-            let result = compile_only(test_code);
+            let strict = only_strict;
+            let result = compile_only(test_code, strict);
             match result {
                 Ok(()) => {
                     return TestResult::Fail(
@@ -317,11 +324,6 @@ fn run_test_file(path: &Path) -> TestResult {
             }
         }
     }
-
-    // Determine modes for runtime tests
-    let only_strict = meta.flags.contains(&"onlyStrict".to_string());
-    let no_strict = meta.flags.contains(&"noStrict".to_string());
-    let is_negative = meta.negative.is_some();
 
     let modes: Vec<(&str, bool)> = if only_strict {
         vec![("strict", true)]
@@ -345,7 +347,7 @@ fn run_test_file(path: &Path) -> TestResult {
         if let Some(ref neg) = meta.negative {
             // Runtime/resolution phase negative test
             let (rt, _) = create_runtime();
-            let result = eval_test(&rt, &code);
+            let result = eval_test(&rt, &code, *use_strict);
             match result {
                 Ok(_) => {
                     return TestResult::Fail(format!(
@@ -374,7 +376,7 @@ fn run_test_file(path: &Path) -> TestResult {
         } else {
             // Normal test
             let (rt, _) = create_runtime();
-            let result = eval_test(&rt, &code);
+            let result = eval_test(&rt, &code, *use_strict);
             match result {
                 Ok(_) => {}
                 Err(e) => {

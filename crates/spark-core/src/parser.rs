@@ -517,6 +517,11 @@ impl Parser {
         }
     }
 
+    /// Set strict mode for parsing (used for test262 runner).
+    pub fn set_strict_mode(&mut self, strict: bool) {
+        self.strict_mode = strict;
+    }
+
     /// Parse the source code into an AST.
     pub fn parse(&mut self) -> Result<ASTNode, ParseError> {
         self.tokenize()?;
@@ -581,9 +586,14 @@ impl Parser {
     }
 
     fn scan_number(&mut self, start: usize, line: usize, col: usize) -> Result<(), ParseError> {
+        // Advance past the first digit (caller has already matched '0'..='9')
+        self.advance_char();
         if self.source[start] == '0' {
             if self.peek_char() == Some('x') || self.peek_char() == Some('X') {
-                self.advance_char();
+                self.advance_char(); // skip 'x'
+                if !self.peek_char().map_or(false, |c| c.is_ascii_hexdigit()) {
+                    return Err(self.mk_err("Invalid hex literal"));
+                }
                 while self.peek_char().map_or(false, |c| c.is_ascii_hexdigit()) { self.advance_char(); }
                 let s: String = self.source[start..self.pos].iter().collect();
                 let v = u64::from_str_radix(&s[2..], 16).map_err(|_| self.mk_err("Invalid hex literal"))?;
@@ -591,7 +601,10 @@ impl Parser {
                 return Ok(());
             }
             if self.peek_char() == Some('b') || self.peek_char() == Some('B') {
-                self.advance_char();
+                self.advance_char(); // skip 'b'
+                if !self.peek_char().map_or(false, |c| c == '0' || c == '1') {
+                    return Err(self.mk_err("Invalid binary literal"));
+                }
                 while self.peek_char() == Some('0') || self.peek_char() == Some('1') { self.advance_char(); }
                 let s: String = self.source[start+2..self.pos].iter().collect();
                 let v = u64::from_str_radix(&s, 2).map_err(|_| self.mk_err("Invalid binary literal"))?;
@@ -599,18 +612,54 @@ impl Parser {
                 return Ok(());
             }
             if self.peek_char() == Some('o') || self.peek_char() == Some('O') {
-                self.advance_char();
+                self.advance_char(); // skip 'o'
+                if !self.peek_char().map_or(false, |c| c.is_ascii_digit() && c < '8') {
+                    return Err(self.mk_err("Invalid octal literal"));
+                }
                 while self.peek_char().map_or(false, |c| c.is_ascii_digit() && c < '8') { self.advance_char(); }
                 let s: String = self.source[start+2..self.pos].iter().collect();
                 let v = u64::from_str_radix(&s, 8).map_err(|_| self.mk_err("Invalid octal literal"))?;
                 self.push_token(TokenType::Number(v as f64), start, line, col);
                 return Ok(());
             }
+            // Legacy octal/non-octal decimal integer: 0 followed by digit
+            // Strict mode: must be rejected
+            // Sloppy mode: fall through to decimal parsing (close enough)
+            if self.peek_char().map_or(false, |c| c.is_ascii_digit()) {
+                if self.strict_mode {
+                    return Err(self.mk_err("Legacy octal integer not allowed in strict mode"));
+                }
+            }
+        } else {
+            // Already advanced past first digit, continue scanning decimals
         }
         while self.peek_char().map_or(false, |c| c.is_ascii_digit()) { self.advance_char(); }
-        if self.peek_char() == Some('.') && self.peek_char_at(1).map_or(false, |c| c.is_ascii_digit()) {
-            self.advance_char();
-            while self.peek_char().map_or(false, |c| c.is_ascii_digit()) { self.advance_char(); }
+        if self.peek_char() == Some('.') {
+            // Check if this is a decimal point (not a property access).
+            // DecimalLiteral :: DecimalIntegerLiteral . DecimalDigits_opt ExponentPart_opt
+            let next = self.peek_char_at(1);
+            if next.map_or(false, |c| c.is_ascii_digit()) {
+                // Has fractional digits: consume '.' and digits
+                self.advance_char();
+                while self.peek_char().map_or(false, |c| c.is_ascii_digit()) { self.advance_char(); }
+            } else {
+                // No fractional digits: trailing dot is valid (e.g. "0.")
+                // Only consume '.' if it's clearly part of the number, not property access
+                // Heuristic: consume '.' if next char is not an identifier start or '('
+                match next {
+                    Some(c) if c.is_alphabetic() || c == '_' || c == '$' => {
+                        // Property access: don't consume '.'
+                    }
+                    Some('(') => {
+                        // Could be method call, but 0.toString() is invalid anyway
+                        // Don't consume '.' — this leaves it for the parser
+                    }
+                    _ => {
+                        // Consume '.' as part of the number literal
+                        self.advance_char();
+                    }
+                }
+            }
         }
         if self.peek_char() == Some('e') || self.peek_char() == Some('E') {
             self.advance_char();
@@ -632,28 +681,98 @@ impl Parser {
                 Some('\\') => {
                     self.advance_char();
                     match self.advance_char() {
+                        // Line continuation: backslash followed by line terminator produces nothing
+                        Some('\n') => { /* skip: line continuation */ }
+                        Some('\r') => {
+                            // Skip \r\n as a single line continuation
+                            if self.peek_char() == Some('\n') { self.advance_char(); }
+                        }
                         Some('n') => result.push('\n'),
                         Some('r') => result.push('\r'),
                         Some('t') => result.push('\t'),
                         Some('\\') => result.push('\\'),
                         Some('\'') => result.push('\''),
                         Some('"') => result.push('"'),
-                        Some('0') => result.push('\0'),
                         Some('b') => result.push('\u{0008}'),
                         Some('f') => result.push('\u{000C}'),
                         Some('v') => result.push('\u{000B}'),
+                        Some('0') => {
+                            // In strict mode, \0 followed by a digit is a SyntaxError.
+                            // In sloppy mode, it's a legacy octal escape.
+                            if self.peek_char().map_or(false, |c| c.is_ascii_digit()) {
+                                if self.strict_mode {
+                                    return Err(self.mk_err("Legacy octal escape not allowed in strict mode"));
+                                }
+                                let mut code = 0u32;
+                                for _ in 0..2 {
+                                    match self.peek_char() {
+                                        Some(c @ '0'..='7') => {
+                                            let nc = code * 8 + c.to_digit(8).unwrap();
+                                            if nc > 255 { break; }
+                                            code = nc;
+                                            self.advance_char();
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                                if let Some(c) = char::from_u32(code) { result.push(c); }
+                            } else {
+                                // Just \0 (null char)
+                                result.push('\0');
+                            }
+                        }
+                        Some(c @ '1'..='7') => {
+                            // Legacy octal escape: \1-\7
+                            if self.strict_mode {
+                                return Err(self.mk_err("Legacy octal escape not allowed in strict mode"));
+                            }
+                            let mut code = c.to_digit(8).unwrap();
+                            for _ in 0..2 {
+                                match self.peek_char() {
+                                    Some(d @ '0'..='7') => {
+                                        let nc = code * 8 + d.to_digit(8).unwrap();
+                                        if nc > 255 { break; }
+                                        code = nc;
+                                        self.advance_char();
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            if let Some(c) = char::from_u32(code) { result.push(c); }
+                        }
                         Some('u') => {
                             if self.peek_char() == Some('{') {
                                 self.advance_char();
                                 let mut hex = String::new();
-                                while self.peek_char() != Some('}') { hex.push(self.advance_char().unwrap()); }
+                                loop {
+                                    match self.peek_char() {
+                                        Some('}') => break,
+                                        Some(c) if c.is_ascii_hexdigit() => {
+                                            hex.push(self.advance_char().unwrap());
+                                        }
+                                        Some(_) => return Err(self.mk_err("Invalid character in Unicode code point escape")),
+                                        None => return Err(self.mk_err("Unterminated Unicode escape sequence")),
+                                    }
+                                }
                                 if self.peek_char() == Some('}') { self.advance_char(); }
+                                if hex.is_empty() {
+                                    return Err(self.mk_err("Empty Unicode code point escape"));
+                                }
                                 if let Ok(cp) = u32::from_str_radix(&hex, 16) {
                                     if let Some(c) = char::from_u32(cp) { result.push(c); }
                                 }
                             } else {
                                 let mut hex = String::new();
-                                for _ in 0..4 { if self.peek_char().map_or(false, |c| c.is_ascii_hexdigit()) { hex.push(self.advance_char().unwrap()); } }
+                                for _ in 0..4 {
+                                    if self.peek_char().map_or(false, |c| c.is_ascii_hexdigit()) {
+                                        hex.push(self.advance_char().unwrap());
+                                    } else {
+                                        return Err(self.mk_err("Invalid unicode escape sequence: expected 4 hex digits"));
+                                    }
+                                }
+                                if hex.len() < 4 {
+                                    return Err(self.mk_err("Invalid unicode escape sequence: expected 4 hex digits"));
+                                }
                                 if let Ok(cp) = u32::from_str_radix(&hex, 16) {
                                     if let Some(c) = char::from_u32(cp) { result.push(c); }
                                 }
@@ -661,10 +780,21 @@ impl Parser {
                         }
                         Some('x') => {
                             let mut hex = String::new();
-                            for _ in 0..2 { if self.peek_char().map_or(false, |c| c.is_ascii_hexdigit()) { hex.push(self.advance_char().unwrap()); } }
+                            for _ in 0..2 {
+                                if self.peek_char().map_or(false, |c| c.is_ascii_hexdigit()) {
+                                    hex.push(self.advance_char().unwrap());
+                                } else {
+                                    return Err(self.mk_err("Invalid hex escape sequence"));
+                                }
+                            }
                             if let Ok(v) = u8::from_str_radix(&hex, 16) { result.push(v as char); }
                         }
-                        Some(c) => { result.push(c); }
+                        Some(c) => {
+                            if self.strict_mode && c.is_ascii_digit() {
+                                return Err(self.mk_err("Non-octal decimal escape not allowed in strict mode"));
+                            }
+                            result.push(c);
+                        }
                         None => return Err(self.mk_err("Unterminated string escape")),
                     }
                 }
@@ -736,12 +866,67 @@ impl Parser {
                 Some('\\') => {
                     self.advance_char();
                     match self.advance_char() {
+                        Some('\n') => { /* line continuation: skip */ }
+                        Some('\r') => {
+                            if self.peek_char() == Some('\n') { self.advance_char(); }
+                        }
                         Some('n') => current.push('\n'),
                         Some('r') => current.push('\r'),
                         Some('t') => current.push('\t'),
                         Some('\\') => current.push('\\'),
                         Some('`') => current.push('`'),
                         Some('$') => current.push('$'),
+                        Some('0') => current.push('\0'),
+                        Some('b') => current.push('\u{0008}'),
+                        Some('f') => current.push('\u{000C}'),
+                        Some('v') => current.push('\u{000B}'),
+                        Some('u') => {
+                            if self.peek_char() == Some('{') {
+                                self.advance_char();
+                                let mut hex = String::new();
+                                loop {
+                                    match self.peek_char() {
+                                        Some('}') => break,
+                                        Some(c) if c.is_ascii_hexdigit() => { hex.push(self.advance_char().unwrap()); }
+                                        Some(_) => return Err(self.mk_err("Invalid character in Unicode code point escape")),
+                                        None => return Err(self.mk_err("Unterminated Unicode escape sequence")),
+                                    }
+                                }
+                                if self.peek_char() == Some('}') { self.advance_char(); }
+                                if !hex.is_empty() {
+                                    if let Ok(cp) = u32::from_str_radix(&hex, 16) {
+                                        if let Some(c) = char::from_u32(cp) { current.push(c); }
+                                    }
+                                }
+                            } else {
+                                let mut hex = String::new();
+                                for _ in 0..4 {
+                                    if self.peek_char().map_or(false, |c| c.is_ascii_hexdigit()) {
+                                        hex.push(self.advance_char().unwrap());
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                if !hex.is_empty() {
+                                    if let Ok(cp) = u32::from_str_radix(&hex, 16) {
+                                        if let Some(c) = char::from_u32(cp) { current.push(c); }
+                                    }
+                                }
+                            }
+                        }
+                        Some('x') => {
+                            let mut hex = String::new();
+                            for _ in 0..2 {
+                                if self.peek_char().map_or(false, |c| c.is_ascii_hexdigit()) {
+                                    hex.push(self.advance_char().unwrap());
+                                } else {
+                                    break;
+                                }
+                            }
+                            if !hex.is_empty() {
+                                if let Ok(v) = u8::from_str_radix(&hex, 16) { current.push(v as char); }
+                            }
+                        }
                         Some(c) => { current.push('\\'); current.push(c); }
                         None => return Err(ParseError::new("Unterminated template literal", line, col)),
                     }
@@ -910,6 +1095,10 @@ impl Parser {
                             Some('\\') => {
                                 self.advance_char();
                                 match self.advance_char() {
+                                    Some('\n') => { /* line continuation: skip */ }
+                                    Some('\r') => {
+                                        if self.peek_char() == Some('\n') { self.advance_char(); }
+                                    }
                                     Some('n') => { current.push('\n'); }
                                     Some('r') => { current.push('\r'); }
                                     Some('t') => { current.push('\t'); }
@@ -917,6 +1106,52 @@ impl Parser {
                                     Some('`') => { current.push('`'); }
                                     Some('$') => { current.push('$'); }
                                     Some('0') => { current.push('\0'); }
+                                    Some('b') => current.push('\u{0008}'),
+                                    Some('f') => current.push('\u{000C}'),
+                                    Some('v') => current.push('\u{000B}'),
+                                    Some('u') => {
+                                        if self.peek_char() == Some('{') {
+                                            self.advance_char();
+                                            let mut hex = String::new();
+                                            loop {
+                                                match self.peek_char() {
+                                                    Some('}') => break,
+                                                    Some(c) if c.is_ascii_hexdigit() => { hex.push(self.advance_char().unwrap()); }
+                                                    Some(_) => return Err(self.mk_err("Invalid character in Unicode code point escape")),
+                                                    None => return Err(self.mk_err("Unterminated Unicode escape sequence")),
+                                                }
+                                            }
+                                            if self.peek_char() == Some('}') { self.advance_char(); }
+                                            if !hex.is_empty() {
+                                                if let Ok(cp) = u32::from_str_radix(&hex, 16) {
+                                                    if let Some(c) = char::from_u32(cp) { current.push(c); }
+                                                }
+                                            }
+                                        } else {
+                                            let mut hex = String::new();
+                                            for _ in 0..4 {
+                                                if self.peek_char().map_or(false, |c| c.is_ascii_hexdigit()) {
+                                                    hex.push(self.advance_char().unwrap());
+                                                } else { break; }
+                                            }
+                                            if !hex.is_empty() {
+                                                if let Ok(cp) = u32::from_str_radix(&hex, 16) {
+                                                    if let Some(c) = char::from_u32(cp) { current.push(c); }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Some('x') => {
+                                        let mut hex = String::new();
+                                        for _ in 0..2 {
+                                            if self.peek_char().map_or(false, |c| c.is_ascii_hexdigit()) {
+                                                hex.push(self.advance_char().unwrap());
+                                            } else { break; }
+                                        }
+                                        if !hex.is_empty() {
+                                            if let Ok(v) = u8::from_str_radix(&hex, 16) { current.push(v as char); }
+                                        }
+                                    }
                                     Some(c) => { current.push(c); }
                                     None => return Err(self.mk_err("Unterminated template literal")),
                                 }
@@ -2232,26 +2467,22 @@ mod tests {
 
     #[test]
     fn test_hex_literal() {
-        // Parser doesn't support 0x prefix (scan_number peek_char bug)
-        assert!(parse_err("0xff").contains("Expected"));
+        assert!(matches!(expr_of(first_stmt(&parse("0xff"))), ASTNode::NumberLiteral(n) if *n == 255.0));
     }
 
     #[test]
     fn test_hex_literal_uppercase() {
-        // Parser doesn't support 0X prefix (scan_number peek_char bug)
-        assert!(parse_err("0XFF").contains("Expected"));
+        assert!(matches!(expr_of(first_stmt(&parse("0XFF"))), ASTNode::NumberLiteral(n) if *n == 255.0));
     }
 
     #[test]
     fn test_octal_literal() {
-        // Parser doesn't support 0o prefix (scan_number peek_char bug)
-        assert!(parse_err("0o77").contains("Expected"));
+        assert!(matches!(expr_of(first_stmt(&parse("0o77"))), ASTNode::NumberLiteral(n) if *n == 63.0));
     }
 
     #[test]
     fn test_binary_literal() {
-        // Parser doesn't support 0b prefix (scan_number peek_char bug)
-        assert!(parse_err("0b1010").contains("Expected"));
+        assert!(matches!(expr_of(first_stmt(&parse("0b1010"))), ASTNode::NumberLiteral(n) if *n == 10.0));
     }
 
     #[test]

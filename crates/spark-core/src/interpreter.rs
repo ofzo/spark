@@ -1282,12 +1282,14 @@ impl Interpreter {
 
             Opcode::GetVar(idx) => {
                 let frame = self.stack.last().unwrap();
-                let val = if (*idx as usize) < frame.locals.len() {
-                    frame.locals[*idx as usize].borrow().clone()
+                if (*idx as usize) < frame.locals.len() {
+                    let val = frame.locals[*idx as usize].borrow().clone();
+                    self.push_stack(val);
                 } else {
-                    JSValue::undefined()
-                };
-                self.push_stack(val);
+                    // Undeclared variable: throw ReferenceError
+                    let name = self.saved_var_names.get(*idx as usize).cloned().unwrap_or_else(|| "?".to_string());
+                    return Err(RuntimeError::with_message(format!("ReferenceError: {} is not defined", name)));
+                }
             }
 
             Opcode::SetVar(idx) => {
