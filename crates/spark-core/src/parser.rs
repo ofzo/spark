@@ -1273,6 +1273,9 @@ impl Parser {
                     pattern.push(self.advance_char().unwrap()); // backslash
                     match self.peek_char() {
                         None => return Err(self.mk_err("Unterminated escape in regex")),
+                        Some('\n') | Some('\r') => {
+                            return Err(self.mk_err("Backslash cannot be followed by line terminator in regex"));
+                        }
                         Some('k') => {
                             // Named backreference \k<name>
                             pattern.push(self.advance_char().unwrap());
@@ -1421,14 +1424,13 @@ impl Parser {
                 // Optional: remove modifiers (-ims)
                 if self.peek_char() == Some('-') {
                     pattern.push(self.advance_char().unwrap());
-                    let mut rm_seen: u32 = 0;
                     while self.peek_char().map_or(false, |c| matches!(c, 'i' | 'm' | 's')) {
                         let ch = self.advance_char().unwrap();
                         let bit = 1u32 << (ch as u32 - 'a' as u32);
-                        if rm_seen & bit != 0 {
-                            return Err(self.mk_err("Duplicate regex modifier removal"));
+                        if seen & bit != 0 {
+                            return Err(self.mk_err("Duplicate regex modifier"));
                         }
-                        rm_seen |= bit;
+                        seen |= bit;
                         pattern.push(ch);
                     }
                 }
@@ -1515,13 +1517,29 @@ impl Parser {
         let chars: Vec<char> = pattern.chars().collect();
         let mut i = 0;
         let mut in_class = false;
-        let mut prev_was_assertion = false; // track lookahead/behind for u-flag quantifier check
+        let mut prev_was_assertion = false;
+        let mut prev_was_atom = false;
 
         while i < chars.len() {
             let ch = chars[i];
             match ch {
-                '[' => { in_class = true; i += 1; }
-                ']' => { in_class = false; prev_was_assertion = false; i += 1; }
+                '[' => {
+                    in_class = true;
+                    prev_was_atom = true;
+                    // Check for empty range like [--\d] with u flag
+                    if unicode && i + 2 < chars.len() {
+                        if chars[i+1] == '-' && chars[i+2] == '-' {
+                            return Err(self.mk_err("Invalid character class range in unicode regex"));
+                        }
+                    }
+                    i += 1;
+                }
+                ']' => {
+                    in_class = false;
+                    prev_was_atom = true;
+                    prev_was_assertion = false;
+                    i += 1;
+                }
                 '\\' => {
                     i += 1;
                     prev_was_assertion = false;
@@ -1545,11 +1563,16 @@ impl Parser {
                                 }
                                 if chars[i] == '{' {
                                     i += 1;
+                                    let mut hex_val: u32 = 0;
                                     while i < chars.len() && chars[i] != '}' {
                                         if !chars[i].is_ascii_hexdigit() {
                                             return Err(self.mk_err("Invalid unicode escape in regex"));
                                         }
+                                        hex_val = hex_val.saturating_mul(16).saturating_add(chars[i].to_digit(16).unwrap());
                                         i += 1;
+                                    }
+                                    if hex_val > 0x10FFFF {
+                                        return Err(self.mk_err("Unicode code point out of bounds"));
                                     }
                                 } else {
                                     for _ in 0..4 {
@@ -1572,7 +1595,6 @@ impl Parser {
                     i += 1;
                 }
                 '{' if !in_class => {
-                    // Check if this is a quantifier
                     let mut j = i + 1;
                     let mut has_digits = false;
                     while j < chars.len() && chars[j].is_ascii_digit() {
@@ -1583,10 +1605,20 @@ impl Parser {
                         if unicode {
                             return Err(self.mk_err("Invalid extended pattern character in unicode regex"));
                         }
-                    } else if unicode && prev_was_assertion {
-                        return Err(self.mk_err("Quantifiable assertion disallowed with u flag"));
+                    } else {
+                        // Bare quantifier: must follow an atom
+                        if !prev_was_atom {
+                            return Err(self.mk_err("Quantifier without preceding atom"));
+                        }
+                        // Quantifiable assertion disallowed with u flag
+                        if unicode && prev_was_assertion {
+                            return Err(self.mk_err("Quantifiable assertion disallowed with u flag"));
+                        }
+                        // Quantifiable lookbehind always disallowed
+                        if prev_was_assertion {
+                            return Err(self.mk_err("Quantifiable assertion disallowed"));
+                        }
                     }
-                    // Skip past quantifier
                     if has_digits {
                         i = j;
                         if i < chars.len() && chars[i] == ',' { i += 1; }
@@ -1596,24 +1628,38 @@ impl Parser {
                         i += 1;
                     }
                     prev_was_assertion = false;
+                    prev_was_atom = false;
                 }
                 '(' => {
-                    // Check for lookahead/behind: (?= or (?!
                     if i + 2 < chars.len() && chars[i+1] == '?' {
-                        match chars.get(i+2) {
-                            Some('=') | Some('!') => prev_was_assertion = true,
-                            Some('<') if i + 3 < chars.len() => {
-                                match chars[i+3] {
-                                    '=' | '!' => prev_was_assertion = true,
-                                    _ => {}
-                                }
-                            }
-                            _ => {}
+                        let is_lookbehind = matches!(chars.get(i+2), Some('<')) && i + 3 < chars.len() && matches!(chars.get(i+3), Some('=') | Some('!'));
+                        let is_lookahead = matches!(chars.get(i+2), Some('=') | Some('!'));
+                        if is_lookbehind || is_lookahead {
+                            prev_was_assertion = true;
                         }
                     }
+                    prev_was_atom = true;
                     i += 1;
                 }
-                _ => { prev_was_assertion = false; i += 1; }
+                ')' | '.' | '*' | '+' | '?' | '^' | '$' | '|' => {
+                    let is_quantifier = matches!(ch, '*' | '+' | '?');
+                    if is_quantifier {
+                        if !prev_was_atom {
+                            return Err(self.mk_err("Quantifier without preceding atom"));
+                        }
+                        if prev_was_assertion {
+                            return Err(self.mk_err("Quantifiable assertion disallowed"));
+                        }
+                    }
+                    prev_was_atom = matches!(ch, ')' | '.' | '^' | '$');
+                    prev_was_assertion = false;
+                    i += 1;
+                }
+                _ => {
+                    prev_was_atom = true;
+                    prev_was_assertion = false;
+                    i += 1;
+                }
             }
         }
         Ok(())
