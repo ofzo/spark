@@ -1577,8 +1577,9 @@ impl Compiler {
                         }
                     }
                     _ => {
-                        self.compile_expr(right)?;
-                        self.emit(Opcode::Pop);
+                        return Err(CompileError::new(
+                            "SyntaxError: Invalid left-hand side in assignment"
+                        ));
                     }
                 }
                 Ok(())
@@ -1628,9 +1629,14 @@ impl Compiler {
             self.emit(arith_op);
             self.emit(Opcode::SetVar(var_idx));
             // SetVar pushes the value already
-        } else {
+        } else if let ASTNode::Member { .. } = left {
+            // Compound assignment to member expression
             self.compile_expr(right)?;
             self.emit(Opcode::Pop);
+        } else {
+            return Err(CompileError::new(
+                "SyntaxError: Invalid left-hand side in compound assignment"
+            ));
         }
         Ok(())
     }
@@ -2507,8 +2513,8 @@ mod typeof_tests {
         println!("Bytecode: {:?}", bytecode.bytecode);
         println!("Constants: {:?}", bytecode.constants);
         
-        // Should have GetPropertyByName for "Array"
-        assert!(bytecode.bytecode.iter().any(|op| matches!(op, Opcode::GetPropertyByName(_))));
+        // Should have GetGlobalVar for "Array" (global variable lookup)
+        assert!(bytecode.bytecode.iter().any(|op| matches!(op, Opcode::GetGlobalVar(_))));
     }
 }
 
