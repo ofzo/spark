@@ -587,12 +587,20 @@ impl Parser {
 
     /// Read digits (in the given base predicate), skipping `_` separators.
     fn read_digits(&mut self, is_digit: impl Fn(char) -> bool) {
-        while self.peek_char().map_or(false, &is_digit) {
-            self.advance_char();
-            // Numeric separator: _ followed by a valid digit
+        loop {
+            // Check for numeric separator: _ followed by a valid digit
             if self.peek_char() == Some('_') && self.peek_char_at(1).map_or(false, &is_digit) {
                 self.advance_char(); // skip '_'
+                // Now consume the digit
+                self.advance_char();
+                continue;
             }
+            // Check for a regular digit
+            if self.peek_char().map_or(false, &is_digit) {
+                self.advance_char();
+                continue;
+            }
+            break;
         }
     }
 
@@ -634,10 +642,24 @@ impl Parser {
                 return Ok(());
             }
             // Legacy octal/non-octal decimal integer: 0 followed by digit
-            if self.peek_char().map_or(false, |c| c.is_ascii_digit()) {
+            // Numeric separators are NOT allowed in legacy octal/decimal literals
+            let is_legacy = self.peek_char().map_or(false, |c| c.is_ascii_digit());
+            if is_legacy {
                 if self.strict_mode {
                     return Err(self.mk_err("Legacy octal integer not allowed in strict mode"));
                 }
+                // Check for invalid separator: 0_1, 07_0, etc.
+                let saved_pos = self.pos;
+                while self.peek_char().map_or(false, |c| c.is_ascii_digit() || c == '_') {
+                    if self.peek_char() == Some('_') {
+                        return Err(self.mk_err("Numeric separator not allowed in legacy octal literal"));
+                    }
+                    self.advance_char();
+                }
+                let s: String = self.source[start..self.pos].iter().collect();
+                let v: f64 = s.parse().unwrap_or(0.0);
+                self.push_token(TokenType::Number(v), start, line, col);
+                return Ok(());
             }
         }
         self.read_digits(|c| c.is_ascii_digit());
@@ -1211,28 +1233,390 @@ impl Parser {
     fn scan_regex(&mut self, start: usize, line: usize, col: usize) -> Result<(), ParseError> {
         let mut pattern = String::new();
         let mut in_class = false;
+        let mut is_first = true;
+
         loop {
             match self.peek_char() {
                 None => return Err(self.mk_err("Unterminated regex literal")),
                 Some('/') if !in_class => {
                     self.advance_char();
                     let mut flags = String::new();
-                    while self.peek_char().map_or(false, |c| matches!(c, 'g'|'i'|'m'|'s'|'u'|'y')) {
-                        flags.push(self.advance_char().unwrap());
+                    let mut seen_flags: u8 = 0;
+                    while self.peek_char().map_or(false, |c| matches!(c, 'g'|'i'|'m'|'s'|'u'|'y'|'d')) {
+                        let f = self.advance_char().unwrap();
+                        let bit = match f {
+                            'g' => 1, 'i' => 2, 'm' => 4, 's' => 8, 'u' => 16, 'y' => 32, 'd' => 64,
+                            _ => 0,
+                        };
+                        if seen_flags & bit != 0 {
+                            return Err(self.mk_err("Duplicate regex flag"));
+                        }
+                        seen_flags |= bit;
+                        flags.push(f);
                     }
+                    // Validate the pattern with flag context
+                    self.validate_regex_pattern(&pattern, flags.contains('u'))?;
                     self.push_token(TokenType::RegExp { pattern, flags }, start, line, col);
                     return Ok(());
                 }
-                Some('[') => { in_class = true; pattern.push(self.advance_char().unwrap()); }
-                Some(']') if in_class => { in_class = false; pattern.push(self.advance_char().unwrap()); }
-                Some('\\') => {
+                Some('[') => {
+                    is_first = false;
+                    in_class = true;
                     pattern.push(self.advance_char().unwrap());
-                    if let Some(c) = self.advance_char() { pattern.push(c); }
                 }
-                Some('\n') => return Err(self.mk_err("Unterminated regex literal")),
-                Some(c) => { self.advance_char(); pattern.push(c); }
+                Some(']') if in_class => {
+                    in_class = false;
+                    pattern.push(self.advance_char().unwrap());
+                }
+                Some('\\') => {
+                    is_first = false;
+                    pattern.push(self.advance_char().unwrap()); // backslash
+                    match self.peek_char() {
+                        None => return Err(self.mk_err("Unterminated escape in regex")),
+                        Some('k') => {
+                            // Named backreference \k<name>
+                            pattern.push(self.advance_char().unwrap());
+                            if self.peek_char() == Some('<') {
+                                pattern.push(self.advance_char().unwrap());
+                                self.read_regex_group_name(&mut pattern)?;
+                            }
+                        }
+                        Some('u') => {
+                            pattern.push(self.advance_char().unwrap()); // u
+                            if self.peek_char() == Some('{') {
+                                // Unicode code point: \u{...}
+                                pattern.push(self.advance_char().unwrap()); // {
+                                loop {
+                                    match self.peek_char() {
+                                        None => return Err(self.mk_err("Unterminated unicode escape")),
+                                        Some('}') => {
+                                            pattern.push(self.advance_char().unwrap());
+                                            break;
+                                        }
+                                        Some(c) => {
+                                            pattern.push(self.advance_char().unwrap());
+                                        }
+                                    }
+                                }
+                            } else {
+                                // \u followed by hex digits
+                                for _ in 0..4 {
+                                    if self.peek_char().map_or(false, |c| c.is_ascii_hexdigit()) {
+                                        pattern.push(self.advance_char().unwrap());
+                                    }
+                                }
+                            }
+                        }
+                        Some('x') => {
+                            pattern.push(self.advance_char().unwrap()); // x
+                            // \x followed by 2 hex digits
+                            for _ in 0..2 {
+                                if self.peek_char().map_or(false, |c| c.is_ascii_hexdigit()) {
+                                    pattern.push(self.advance_char().unwrap());
+                                }
+                            }
+                        }
+                        Some('c') => {
+                            pattern.push(self.advance_char().unwrap()); // c
+                            // \c followed by control letter
+                            if self.peek_char().map_or(false, |c| c.is_ascii_alphabetic()) {
+                                pattern.push(self.advance_char().unwrap());
+                            }
+                        }
+                        Some('p') | Some('P') => {
+                            pattern.push(self.advance_char().unwrap());
+                            // Unicode property escape: \p{...} or \P{...}
+                            if self.peek_char() == Some('{') {
+                                pattern.push(self.advance_char().unwrap());
+                                loop {
+                                    match self.peek_char() {
+                                        None => return Err(self.mk_err("Unterminated unicode property escape")),
+                                        Some('}') => {
+                                            pattern.push(self.advance_char().unwrap());
+                                            break;
+                                        }
+                                        Some(c) => {
+                                            pattern.push(self.advance_char().unwrap());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Some(c) => {
+                            pattern.push(self.advance_char().unwrap());
+                        }
+                    }
+                }
+                Some('\n') | Some('\r') => {
+                    return Err(self.mk_err("Unterminated regex literal"));
+                }
+                Some('\u{2028}') | Some('\u{2029}') => {
+                    return Err(self.mk_err("Line separator not allowed in regex literal"));
+                }
+                Some('*') | Some('\\') | Some('/') if is_first => {
+                    return Err(self.mk_err("Invalid first character in regex literal"));
+                }
+                Some('{') => {
+                    is_first = false;
+                    pattern.push(self.advance_char().unwrap());
+                    if !in_class {
+                        self.validate_regex_quantifier(&mut pattern)?;
+                    }
+                }
+                Some('(') => {
+                    is_first = false;
+                    pattern.push(self.advance_char().unwrap());
+                    if self.peek_char() == Some('?') {
+                        pattern.push(self.advance_char().unwrap());
+                        self.validate_regex_group(&mut pattern)?;
+                    }
+                }
+                Some(')') => {
+                    is_first = false;
+                    pattern.push(self.advance_char().unwrap());
+                }
+                Some(c) => {
+                    is_first = false;
+                    pattern.push(self.advance_char().unwrap());
+                }
             }
         }
+    }
+
+    /// Validate the contents of a regex group starting with (?.
+    fn validate_regex_group(&mut self, pattern: &mut String) -> Result<(), ParseError> {
+        match self.peek_char() {
+            None => Err(self.mk_err("Unterminated regex group")),
+            Some(':') | Some('=') | Some('!') => {
+                pattern.push(self.advance_char().unwrap());
+                Ok(())
+            }
+            Some('<') => {
+                pattern.push(self.advance_char().unwrap());
+                match self.peek_char() {
+                    Some('=') | Some('!') => {
+                        // Lookbehind: (?<= or (?<!
+                        pattern.push(self.advance_char().unwrap());
+                        Ok(())
+                    }
+                    _ => {
+                        // Named capture: (?<name>
+                        self.read_regex_group_name(pattern)
+                    }
+                }
+            }
+            Some(c) if c == 'i' || c == 'm' || c == 's' => {
+                // Modifier: (?i:s) or (?ims-ims:pattern)
+                // Valid modifier flags are only: i, m, s
+                let mut seen: u32 = 0;
+                while self.peek_char().map_or(false, |c| matches!(c, 'i' | 'm' | 's')) {
+                    let ch = self.advance_char().unwrap();
+                    let bit = 1u32 << (ch as u32 - 'a' as u32);
+                    if seen & bit != 0 {
+                        return Err(self.mk_err("Duplicate regex modifier"));
+                    }
+                    seen |= bit;
+                    pattern.push(ch);
+                }
+                // Optional: remove modifiers (-ims)
+                if self.peek_char() == Some('-') {
+                    pattern.push(self.advance_char().unwrap());
+                    let mut rm_seen: u32 = 0;
+                    while self.peek_char().map_or(false, |c| matches!(c, 'i' | 'm' | 's')) {
+                        let ch = self.advance_char().unwrap();
+                        let bit = 1u32 << (ch as u32 - 'a' as u32);
+                        if rm_seen & bit != 0 {
+                            return Err(self.mk_err("Duplicate regex modifier removal"));
+                        }
+                        rm_seen |= bit;
+                        pattern.push(ch);
+                    }
+                }
+                // Must be followed by :
+                if self.peek_char() != Some(':') {
+                    return Err(self.mk_err("Expected : after regex modifiers"));
+                }
+                pattern.push(self.advance_char().unwrap());
+                Ok(())
+            }
+            Some(_) => Err(self.mk_err("Invalid regex group")),
+        }
+    }
+
+    /// Read a regex group name: <name>
+    fn read_regex_group_name(&mut self, pattern: &mut String) -> Result<(), ParseError> {
+        // First char must be identifier start
+        match self.peek_char() {
+            None => return Err(self.mk_err("Unterminated regex group name")),
+            Some('>') => return Err(self.mk_err("Empty regex group name")),
+            Some(c) if !c.is_ascii_alphabetic() && c != '_' && c != '$' => {
+                return Err(self.mk_err("Invalid regex group name start"));
+            }
+            Some(_) => { pattern.push(self.advance_char().unwrap()); }
+        }
+        // Rest of name
+        loop {
+            match self.peek_char() {
+                None => return Err(self.mk_err("Unterminated regex group name")),
+                Some('>') => { pattern.push(self.advance_char().unwrap()); break; }
+                Some(c) if c.is_ascii_alphanumeric() || c == '_' => {
+                    pattern.push(self.advance_char().unwrap());
+                }
+                Some(_) => return Err(self.mk_err("Invalid character in regex group name")),
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate a braced quantifier: {n}, {n,}, {n,m}
+    fn validate_regex_quantifier(&mut self, pattern: &mut String) -> Result<(), ParseError> {
+        // Read digits for lower bound
+        let mut has_lower = false;
+        while self.peek_char().map_or(false, |c| c.is_ascii_digit()) {
+            has_lower = true;
+            pattern.push(self.advance_char().unwrap());
+        }
+        if !has_lower {
+            // Not a quantifier, just literal { followed by non-digit
+            return Ok(());
+        }
+        match self.peek_char() {
+            Some('}') => {
+                pattern.push(self.advance_char().unwrap());
+                Ok(())
+            }
+            Some(',') => {
+                pattern.push(self.advance_char().unwrap());
+                if self.peek_char() == Some('}') {
+                    pattern.push(self.advance_char().unwrap());
+                    return Ok(());
+                }
+                let mut has_upper = false;
+                while self.peek_char().map_or(false, |c| c.is_ascii_digit()) {
+                    has_upper = true;
+                    pattern.push(self.advance_char().unwrap());
+                }
+                if !has_upper {
+                    return Err(self.mk_err("Invalid quantifier: expected digit or }"));
+                }
+                if self.peek_char() == Some('}') {
+                    pattern.push(self.advance_char().unwrap());
+                    Ok(())
+                } else {
+                    Err(self.mk_err("Invalid quantifier: expected }"))
+                }
+            }
+            _ => Err(self.mk_err("Invalid quantifier: expected } or ,")),
+        }
+    }
+
+    /// Validate a regex pattern string against its flags (post-scan).
+    fn validate_regex_pattern(&self, pattern: &str, unicode: bool) -> Result<(), ParseError> {
+        let chars: Vec<char> = pattern.chars().collect();
+        let mut i = 0;
+        let mut in_class = false;
+        let mut prev_was_assertion = false; // track lookahead/behind for u-flag quantifier check
+
+        while i < chars.len() {
+            let ch = chars[i];
+            match ch {
+                '[' => { in_class = true; i += 1; }
+                ']' => { in_class = false; prev_was_assertion = false; i += 1; }
+                '\\' => {
+                    i += 1;
+                    prev_was_assertion = false;
+                    if i >= chars.len() { break; }
+                    let esc = chars[i];
+                    if unicode {
+                        match esc {
+                            '^' | '$' | '\\' | '.' | '*' | '+' | '?' |
+                            '(' | ')' | '[' | ']' | '{' | '}' | '|' | '/' |
+                            'b' | 'B' | 'd' | 'D' | 'f' | 'n' | 'r' | 's' | 'S' |
+                            't' | 'v' | 'w' | 'W' | 'k' | 'p' | 'P' | 'c' | 'x' => {},
+                            '0' => {
+                                if i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
+                                    return Err(self.mk_err("Invalid decimal escape in unicode regex"));
+                                }
+                            }
+                            'u' => {
+                                i += 1;
+                                if i >= chars.len() {
+                                    return Err(self.mk_err("Invalid unicode escape in regex"));
+                                }
+                                if chars[i] == '{' {
+                                    i += 1;
+                                    while i < chars.len() && chars[i] != '}' {
+                                        if !chars[i].is_ascii_hexdigit() {
+                                            return Err(self.mk_err("Invalid unicode escape in regex"));
+                                        }
+                                        i += 1;
+                                    }
+                                } else {
+                                    for _ in 0..4 {
+                                        if i >= chars.len() || !chars[i].is_ascii_hexdigit() {
+                                            return Err(self.mk_err("Invalid unicode escape in regex"));
+                                        }
+                                        i += 1;
+                                    }
+                                    i -= 1;
+                                }
+                            }
+                            c if c.is_ascii_digit() => {
+                                return Err(self.mk_err("Invalid decimal escape in unicode regex"));
+                            }
+                            _ => {
+                                return Err(self.mk_err("Invalid identity escape in unicode regex"));
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+                '{' if !in_class => {
+                    // Check if this is a quantifier
+                    let mut j = i + 1;
+                    let mut has_digits = false;
+                    while j < chars.len() && chars[j].is_ascii_digit() {
+                        has_digits = true;
+                        j += 1;
+                    }
+                    if !has_digits {
+                        if unicode {
+                            return Err(self.mk_err("Invalid extended pattern character in unicode regex"));
+                        }
+                    } else if unicode && prev_was_assertion {
+                        return Err(self.mk_err("Quantifiable assertion disallowed with u flag"));
+                    }
+                    // Skip past quantifier
+                    if has_digits {
+                        i = j;
+                        if i < chars.len() && chars[i] == ',' { i += 1; }
+                        while i < chars.len() && chars[i].is_ascii_digit() { i += 1; }
+                        if i < chars.len() && chars[i] == '}' { i += 1; }
+                    } else {
+                        i += 1;
+                    }
+                    prev_was_assertion = false;
+                }
+                '(' => {
+                    // Check for lookahead/behind: (?= or (?!
+                    if i + 2 < chars.len() && chars[i+1] == '?' {
+                        match chars.get(i+2) {
+                            Some('=') | Some('!') => prev_was_assertion = true,
+                            Some('<') if i + 3 < chars.len() => {
+                                match chars[i+3] {
+                                    '=' | '!' => prev_was_assertion = true,
+                                    _ => {}
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    i += 1;
+                }
+                _ => { prev_was_assertion = false; i += 1; }
+            }
+        }
+        Ok(())
     }
 
     // ===== Token Stream Helpers =====
