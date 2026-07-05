@@ -894,6 +894,29 @@ impl Interpreter {
                 self.push_stack(JSValue::Object(global));
             }
 
+            Opcode::GetGlobalVar(idx) => {
+                let name = self.get_constant_string(*idx)?;
+                let global_val = JSValue::Object(self.context.global.clone());
+                let val = global_val.get_property(&name).unwrap_or(JSValue::undefined());
+                if val.is_undefined() {
+                    let err = JSValue::object("ReferenceError");
+                    err.set_property("message", JSValue::string(&format!("{} is not defined", name)));
+                    err.set_property("name", JSValue::string("ReferenceError"));
+                    // Set prototype to ReferenceError.prototype for instanceof to work
+                    let ref_error = global_val.get_property("ReferenceError");
+                    if let Some(proto) = ref_error.and_then(|r| r.get_property("prototype")) {
+                        if let JSValue::Object(obj) = &err {
+                            if let JSValue::Object(p) = &proto {
+                                obj.borrow_mut().prototype = Some(p.clone());
+                            }
+                        }
+                    }
+                    self.pending_exception = Some(err);
+                    return Ok(OpcodeAction::Continue);
+                }
+                self.push_stack(val);
+            }
+
             Opcode::PushUndefined => {
                 let frame = self.stack.last_mut().unwrap();
                 frame.push(JSValue::undefined());
@@ -2045,6 +2068,28 @@ impl Interpreter {
 
             Opcode::Nop => {
                 // No operation
+            }
+            Opcode::GetGlobalVar(idx) => {
+                let name = self.get_constant_string(*idx)?;
+                let global_val = JSValue::Object(self.context.global.clone());
+                let val = global_val.get_property(&name).unwrap_or(JSValue::undefined());
+                if val.is_undefined() {
+                    let err = JSValue::object("ReferenceError");
+                    err.set_property("message", JSValue::string(&format!("{} is not defined", name)));
+                    err.set_property("name", JSValue::string("ReferenceError"));
+                    // Set prototype to ReferenceError.prototype for instanceof to work
+                    let ref_error = global_val.get_property("ReferenceError");
+                    if let Some(proto) = ref_error.and_then(|r| r.get_property("prototype")) {
+                        if let JSValue::Object(obj) = &err {
+                            if let JSValue::Object(p) = &proto {
+                                obj.borrow_mut().prototype = Some(p.clone());
+                            }
+                        }
+                    }
+                    self.pending_exception = Some(err);
+                    return Ok(OpcodeAction::Continue);
+                }
+                self.push_stack(val);
             }
         }
 

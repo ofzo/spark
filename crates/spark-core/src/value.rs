@@ -20,6 +20,7 @@ pub enum Opcode {
     // Stack operations
     PushUndefined,
     GetGlobal,
+    GetGlobalVar(u32),
     PushNull,
     PushBool(bool),
     PushInt(i32),

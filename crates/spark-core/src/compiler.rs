@@ -293,10 +293,9 @@ impl Compiler {
                     // Variable in outer scope of current function
                     self.emit(Opcode::GetVar(var_idx));
                 } else {
-                    // Look up on global object
-                    self.emit(Opcode::GetGlobal);
+                    // Look up on global object — throw ReferenceError if not defined
                     let idx = self.add_constant(Constant::String(name.to_string()));
-                    self.emit(Opcode::GetPropertyByName(idx));
+                    self.emit(Opcode::GetGlobalVar(idx));
                 }
                 Ok(())
             }
