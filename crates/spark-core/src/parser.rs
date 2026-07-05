@@ -585,6 +585,17 @@ impl Parser {
         self.tokens.push(Token { token_type: tt, line, column: col, start, end: self.pos });
     }
 
+    /// Read digits (in the given base predicate), skipping `_` separators.
+    fn read_digits(&mut self, is_digit: impl Fn(char) -> bool) {
+        while self.peek_char().map_or(false, &is_digit) {
+            self.advance_char();
+            // Numeric separator: _ followed by a valid digit
+            if self.peek_char() == Some('_') && self.peek_char_at(1).map_or(false, &is_digit) {
+                self.advance_char(); // skip '_'
+            }
+        }
+    }
+
     fn scan_number(&mut self, start: usize, line: usize, col: usize) -> Result<(), ParseError> {
         // Advance past the first digit (caller has already matched '0'..='9')
         self.advance_char();
@@ -594,8 +605,8 @@ impl Parser {
                 if !self.peek_char().map_or(false, |c| c.is_ascii_hexdigit()) {
                     return Err(self.mk_err("Invalid hex literal"));
                 }
-                while self.peek_char().map_or(false, |c| c.is_ascii_hexdigit()) { self.advance_char(); }
-                let s: String = self.source[start..self.pos].iter().collect();
+                self.read_digits(|c| c.is_ascii_hexdigit());
+                let s: String = self.source[start..self.pos].iter().filter(|c| **c != '_').collect();
                 let v = u64::from_str_radix(&s[2..], 16).map_err(|_| self.mk_err("Invalid hex literal"))?;
                 self.push_token(TokenType::Number(v as f64), start, line, col);
                 return Ok(());
@@ -605,9 +616,9 @@ impl Parser {
                 if !self.peek_char().map_or(false, |c| c == '0' || c == '1') {
                     return Err(self.mk_err("Invalid binary literal"));
                 }
-                while self.peek_char() == Some('0') || self.peek_char() == Some('1') { self.advance_char(); }
-                let s: String = self.source[start+2..self.pos].iter().collect();
-                let v = u64::from_str_radix(&s, 2).map_err(|_| self.mk_err("Invalid binary literal"))?;
+                self.read_digits(|c| c == '0' || c == '1');
+                let s: String = self.source[start..self.pos].iter().filter(|c| **c != '_').collect();
+                let v = u64::from_str_radix(&s[2..], 2).map_err(|_| self.mk_err("Invalid binary literal"))?;
                 self.push_token(TokenType::Number(v as f64), start, line, col);
                 return Ok(());
             }
@@ -616,37 +627,30 @@ impl Parser {
                 if !self.peek_char().map_or(false, |c| c.is_ascii_digit() && c < '8') {
                     return Err(self.mk_err("Invalid octal literal"));
                 }
-                while self.peek_char().map_or(false, |c| c.is_ascii_digit() && c < '8') { self.advance_char(); }
-                let s: String = self.source[start+2..self.pos].iter().collect();
-                let v = u64::from_str_radix(&s, 8).map_err(|_| self.mk_err("Invalid octal literal"))?;
+                self.read_digits(|c| c.is_ascii_digit() && c < '8');
+                let s: String = self.source[start..self.pos].iter().filter(|c| **c != '_').collect();
+                let v = u64::from_str_radix(&s[2..], 8).map_err(|_| self.mk_err("Invalid octal literal"))?;
                 self.push_token(TokenType::Number(v as f64), start, line, col);
                 return Ok(());
             }
             // Legacy octal/non-octal decimal integer: 0 followed by digit
-            // Strict mode: must be rejected
-            // Sloppy mode: fall through to decimal parsing (close enough)
             if self.peek_char().map_or(false, |c| c.is_ascii_digit()) {
                 if self.strict_mode {
                     return Err(self.mk_err("Legacy octal integer not allowed in strict mode"));
                 }
             }
-        } else {
-            // Already advanced past first digit, continue scanning decimals
         }
-        while self.peek_char().map_or(false, |c| c.is_ascii_digit()) { self.advance_char(); }
+        self.read_digits(|c| c.is_ascii_digit());
         if self.peek_char() == Some('.') {
-            // DecimalLiteral :: DecimalIntegerLiteral . DecimalDigits_opt ExponentPart_opt
-            // Always consume '.' as part of the number — 0.toString() is meant to be
-            // a syntax error in JS; the correct form is (0).toString() or 0..toString()
             self.advance_char(); // consume '.'
-            while self.peek_char().map_or(false, |c| c.is_ascii_digit()) { self.advance_char(); }
+            self.read_digits(|c| c.is_ascii_digit());
         }
         if self.peek_char() == Some('e') || self.peek_char() == Some('E') {
             self.advance_char();
             if self.peek_char() == Some('+') || self.peek_char() == Some('-') { self.advance_char(); }
-            while self.peek_char().map_or(false, |c| c.is_ascii_digit()) { self.advance_char(); }
+            self.read_digits(|c| c.is_ascii_digit());
         }
-        let s: String = self.source[start..self.pos].iter().collect();
+        let s: String = self.source[start..self.pos].iter().filter(|c| **c != '_').collect();
         let v: f64 = s.parse().map_err(|_| self.mk_err("Invalid number literal"))?;
         self.push_token(TokenType::Number(v), start, line, col);
         Ok(())
@@ -1178,6 +1182,7 @@ impl Parser {
                         TokenType::Number(_) | TokenType::String(_) | TokenType::Bool(_)
                         | TokenType::Null | TokenType::Undefined | TokenType::RParen
                         | TokenType::RBracket | TokenType::Identifier(_)
+                        | TokenType::RegExp { .. } | TokenType::RBrace
                     ));
                     if prev_is_value {
                         let tt = if self.match_char('=') { TokenType::SlashAssign } else { TokenType::Slash };
